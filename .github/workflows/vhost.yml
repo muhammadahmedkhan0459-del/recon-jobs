@@ -10,12 +10,14 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install ffuf
         run: |
-          go install github.com/ffuf/ffuf/v2@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          wget -q https://github.com/ffuf/ffuf/releases/latest/download/ffuf_2.1.0_linux_amd64.tar.gz
+          tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
+          sudo mv ffuf /usr/local/bin/
+          ffuf -V
 
       - name: Verify files exist
         run: |
@@ -60,13 +62,13 @@ jobs:
 
             FUZZED_IPS=$((FUZZED_IPS + 1))
 
-            # HTTP
+            # ── HTTP ──────────────────────────────────────
             read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "http://$ip" 2>/dev/null)
-            B1_CODE="${B1_CODE:-200}"
+            B1_CODE="${B1_CODE:-000}"
 
             read B2_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
@@ -83,14 +85,14 @@ jobs:
             BASELINE_HTTP=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
               grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 
-            if [ -z "$BASELINE_HTTP" ]; then
+            if [ -z "$BASELINE_HTTP" ] || [ "$B1_CODE" = "000" ]; then
               echo "    [!] HTTP unreachable on $ip - skipping HTTP"
               SKIPPED=$((SKIPPED + 1))
             else
               echo "    [+] HTTP baseline size = $BASELINE_HTTP | status = $B1_CODE"
 
-              if [ "$BASELINE_HTTP" = "0" ] || [ "$BASELINE_HTTP" = "000" ]; then
-                echo "    [!] Baseline size is ${BASELINE_HTTP} - switching to status-code filter"
+              if [ "$BASELINE_HTTP" = "0" ]; then
+                echo "    [!] Baseline size is 0 - switching to status-code filter"
                 ffuf \
                   -w subs_bare.txt \
                   -u "http://$ip" \
@@ -119,13 +121,13 @@ jobs:
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi
 
-            # HTTPS
+            # ── HTTPS ─────────────────────────────────────
             read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "https://$ip" 2>/dev/null)
-            B1_CODE="${B1_CODE:-200}"
+            B1_CODE="${B1_CODE:-000}"
 
             read B2_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
@@ -142,14 +144,14 @@ jobs:
             BASELINE_HTTPS=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
               grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 
-            if [ -z "$BASELINE_HTTPS" ]; then
+            if [ -z "$BASELINE_HTTPS" ] || [ "$B1_CODE" = "000" ]; then
               echo "    [!] HTTPS unreachable on $ip - skipping HTTPS"
               SKIPPED=$((SKIPPED + 1))
             else
               echo "    [+] HTTPS baseline size = $BASELINE_HTTPS | status = $B1_CODE"
 
-              if [ "$BASELINE_HTTPS" = "0" ] || [ "$BASELINE_HTTPS" = "000" ]; then
-                echo "    [!] Baseline size is ${BASELINE_HTTPS} - switching to status-code filter"
+              if [ "$BASELINE_HTTPS" = "0" ]; then
+                echo "    [!] Baseline size is 0 - switching to status-code filter"
                 ffuf \
                   -w subs_bare.txt \
                   -u "https://$ip" \

@@ -6,7 +6,7 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 1559
 
     steps:
       - name: Checkout repo
@@ -36,7 +36,7 @@ jobs:
 
       - name: Run VHOST Fuzz on all IPs
         run: |
-          set +e   # ← KEY FIX: don't die on non-zero exits inside the loop
+          set +e
 
           mkdir -p results
           SKIPPED=0
@@ -44,6 +44,60 @@ jobs:
           FUZZED_RUNS=0
 
           > results/ip_map.txt
+
+          # ── parse & save hits so far ──────────────────
+          parse_and_save() {
+            python3 - << 'PYEOF'
+          import json, os, glob
+
+          ip_map = {}
+          try:
+            with open("results/ip_map.txt") as f:
+              for line in f:
+                line = line.strip()
+                if "=" not in line:
+                  continue
+                safe, real = line.split("=", 1)
+                if safe and real:
+                  ip_map[safe] = real
+          except:
+            pass
+
+          rows = []
+          for filepath in glob.glob("results/*.json"):
+            filename = os.path.basename(filepath).replace(".json", "")
+            if filename.startswith("https_"):
+              proto = "https"
+              sanitized_ip = filename[6:]
+            elif filename.startswith("http_"):
+              proto = "http"
+              sanitized_ip = filename[5:]
+            else:
+              continue
+            real_ip = ip_map.get(sanitized_ip, sanitized_ip)
+            try:
+              with open(filepath) as fh:
+                data = json.load(fh)
+            except:
+              continue
+            for r in data.get("results", []):
+              host   = r.get("input", {}).get("FUZZ", "?")
+              status = r.get("status", "?")
+              length = r.get("length", "?")
+              words  = r.get("words", "?")
+              rows.append(f"{proto},{real_ip},{host},{status},{length},{words}")
+
+          with open("results/hits.csv", "w") as out:
+            out.write("Protocol,IP,Host,Status,Length,Words\n")
+            for row in rows:
+              out.write(row + "\n")
+
+          print(f"[checkpoint] Hits saved: {len(rows)}")
+          PYEOF
+          }
+
+          # ── trap: save on ANY exit (timeout, kill, error) ──
+          trap 'echo ""; echo "=== TRAP TRIGGERED - saving results ==="; parse_and_save; echo "=== Results saved ==="' EXIT
 
           while IFS= read -r raw_ip; do
 
@@ -175,6 +229,12 @@ jobs:
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi
 
+            # ── save every 25 IPs ─────────────────────────
+            if (( FUZZED_IPS % 25 == 0 )); then
+              echo "    [checkpoint] Saving results at $FUZZED_IPS IPs..."
+              parse_and_save
+            fi
+
           done < ips.txt
 
           echo ""
@@ -185,76 +245,8 @@ jobs:
           echo "    Skipped       : $SKIPPED"
           echo "========================================"
 
-      - name: Write parser script
-        run: |
-          cat > /tmp/parse_results.py << 'ENDOFSCRIPT'
-          import json, sys, os, glob
-
-          ip_map = {}
-          with open("results/ip_map.txt") as f:
-              for line in f:
-                  line = line.strip()
-                  if "=" not in line:
-                      continue
-                  safe, real = line.split("=", 1)
-                  if safe and real:
-                      ip_map[safe] = real
-
-          rows = []
-          for filepath in glob.glob("results/*.json"):
-              filename = os.path.basename(filepath).replace(".json", "")
-              if filename.startswith("https_"):
-                  proto = "https"
-                  sanitized_ip = filename[6:]
-              elif filename.startswith("http_"):
-                  proto = "http"
-                  sanitized_ip = filename[5:]
-              else:
-                  continue
-
-              real_ip = ip_map.get(sanitized_ip, sanitized_ip)
-
-              try:
-                  with open(filepath) as fh:
-                      data = json.load(fh)
-              except Exception as e:
-                  print(f"Could not parse {filepath}: {e}", file=sys.stderr)
-                  continue
-
-              for r in data.get("results", []):
-                  host   = r.get("input", {}).get("FUZZ", "?")
-                  status = r.get("status", "?")
-                  length = r.get("length", "?")
-                  words  = r.get("words", "?")
-                  rows.append(f"{proto},{real_ip},{host},{status},{length},{words}")
-
-          with open("results/hits.csv", "w") as out:
-              out.write("Protocol,IP,Host,Status,Length,Words\n")
-              for row in rows:
-                  out.write(row + "\n")
-
-          print(f"Total hits: {len(rows)}")
-          ENDOFSCRIPT
-
-      - name: Parse all results into summary
-        run: |
-          [ -s results/ip_map.txt ] || { echo "ip_map.txt empty - no IPs were processed"; exit 1; }
-
-          shopt -s nullglob
-          json_files=(results/*.json)
-          if [ ${#json_files[@]} -eq 0 ]; then
-            echo "No result JSON files found - all IPs unreachable or no hits"
-            echo "No hits found" > results/hits.csv
-            exit 0
-          fi
-
-          python3 /tmp/parse_results.py
-
-          echo ""
-          echo "=== HITS FOUND ==="
-          cat results/hits.csv
-
       - name: Upload full results folder
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vhost-all-results

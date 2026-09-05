@@ -28,14 +28,11 @@ jobs:
           echo "ips.txt       -> $(wc -l < ips.txt) IPs"
           echo "subs_bare.txt -> $(wc -l < subs_bare.txt) subdomains"
 
-      - name: Verify subs_bare.txt has no protocols
+      - name: Strip protocols from subs_bare.txt and dedupe
         run: |
-          BAD=$(grep -cE '^https?://' subs_bare.txt || true)
-          if [ "$BAD" -gt 0 ]; then
-            echo "subs_bare.txt contains $BAD lines with http:// or https://"
-            exit 1
-          fi
-          echo "subs_bare.txt is clean"
+          sed 's|^https\?://||' subs_bare.txt | sort -u > subs_clean.txt
+          mv subs_clean.txt subs_bare.txt
+          echo "subs_bare.txt -> $(wc -l < subs_bare.txt) unique bare subdomains"
 
       - name: Run VHOST Fuzz on all IPs
         run: |

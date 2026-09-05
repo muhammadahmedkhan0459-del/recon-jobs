@@ -1,0 +1,283 @@
+name: VHOST Fuzzer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffuf
+        run: |
+          go install github.com/ffuf/ffuf/v2@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Verify files exist
+        run: |
+          [ -f ips.txt ]       || { echo "❌ ips.txt not found!";       exit 1; }
+          [ -f subs_bare.txt ] || { echo "❌ subs_bare.txt not found!"; exit 1; }
+          [ -s ips.txt ]       || { echo "❌ ips.txt is empty!";        exit 1; }
+          [ -s subs_bare.txt ] || { echo "❌ subs_bare.txt is empty!";  exit 1; }
+          echo "✅ ips.txt       → $(wc -l < ips.txt) IPs"
+          echo "✅ subs_bare.txt → $(wc -l < subs_bare.txt) subdomains"
+
+      - name: Verify subs_bare.txt has no protocols
+        run: |
+          BAD=$(grep -cE '^https?://' subs_bare.txt || true)
+          if [ "$BAD" -gt 0 ]; then
+            echo "❌ subs_bare.txt contains $BAD lines with http:// or https://"
+            exit 1
+          fi
+          echo "✅ subs_bare.txt is clean"
+
+      - name: Run VHOST Fuzz on all IPs
+        run: |
+          mkdir -p results
+          SKIPPED=0
+          FUZZED_IPS=0
+          FUZZED_RUNS=0
+
+          > results/ip_map.txt
+
+          while IFS= read -r raw_ip; do
+
+            [[ -z "$raw_ip" || "$raw_ip" == \#* ]] && continue
+
+            safe_ip=$(echo "$raw_ip" | tr './' '__' | tr -dc 'A-Za-z0-9_-')
+            ip="$raw_ip"
+
+            echo "${safe_ip}=${ip}" >> results/ip_map.txt
+
+            echo ""
+            echo "========================================"
+            echo "[*] Fuzzing: $ip"
+            echo "========================================"
+
+            FUZZED_IPS=$((FUZZED_IPS + 1))
+
+            # ─────────────────────────────────────────
+            # HTTP
+            # ─────────────────────────────────────────
+
+            read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "http://$ip" 2>/dev/null)
+            B1_CODE="${B1_CODE:-200}"
+
+            read B2_BODY _ < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "http://$ip" 2>/dev/null)
+
+            read B3_BODY _ < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "http://$ip" 2>/dev/null)
+
+            BASELINE_HTTP=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
+              grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+
+            if [ -z "$BASELINE_HTTP" ]; then
+              echo "    [!] HTTP unreachable on $ip — skipping HTTP"
+              SKIPPED=$((SKIPPED + 1))
+            else
+              echo "    [+] HTTP baseline size = $BASELINE_HTTP | status = $B1_CODE"
+
+              if [ "$BASELINE_HTTP" = "0" ] || [ "$BASELINE_HTTP" = "000" ]; then
+                echo "    [!] Baseline size is ${BASELINE_HTTP} — switching to status-code filter (-fc $B1_CODE)"
+                ffuf \
+                  -w subs_bare.txt \
+                  -u "http://$ip" \
+                  -H "Host: FUZZ" \
+                  -mc all \
+                  -fc "000,${B1_CODE},404,400,500,502,503" \
+                  -t 40 \
+                  -timeout 5 \
+                  -rate 80 \
+                  -maxtime 120 \
+                  -o "results/http_${safe_ip}.json" \
+                  -of json \
+                  -s 2>/dev/null \
+                  && echo "    [✓] HTTP fuzz done" \
+                  || echo "    [!] ffuf HTTP failed on $ip — continuing"
+              else
+                ffuf \
+                  -w subs_bare.txt \
+                  -u "http://$ip" \
+                  -H "Host: FUZZ" \
+                  -mc all \
+                  -fc "000,404,400,500,502,503" \
+                  -fs "$BASELINE_HTTP" \
+                  -t 40 \
+                  -timeout 5 \
+                  -rate 80 \
+                  -maxtime 120 \
+                  -o "results/http_${safe_ip}.json" \
+                  -of json \
+                  -s 2>/dev/null \
+                  && echo "    [✓] HTTP fuzz done" \
+                  || echo "    [!] ffuf HTTP failed on $ip — continuing"
+              fi
+              FUZZED_RUNS=$((FUZZED_RUNS + 1))
+            fi
+
+            # ─────────────────────────────────────────
+            # HTTPS
+            # ─────────────────────────────────────────
+
+            read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "https://$ip" 2>/dev/null)
+            B1_CODE="${B1_CODE:-200}"
+
+            read B2_BODY _ < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "https://$ip" 2>/dev/null)
+
+            read B3_BODY _ < <(curl -sk -o /dev/null \
+              -w "%{size_download} %{http_code}" \
+              -H "Host: totalgarbagexyz123abc.com" \
+              --connect-timeout 3 --max-time 5 \
+              "https://$ip" 2>/dev/null)
+
+            BASELINE_HTTPS=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
+              grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+
+            if [ -z "$BASELINE_HTTPS" ]; then
+              echo "    [!] HTTPS unreachable on $ip — skipping HTTPS"
+              SKIPPED=$((SKIPPED + 1))
+            else
+              echo "    [+] HTTPS baseline size = $BASELINE_HTTPS | status = $B1_CODE"
+
+              if [ "$BASELINE_HTTPS" = "0" ] || [ "$BASELINE_HTTPS" = "000" ]; then
+                echo "    [!] Baseline size is ${BASELINE_HTTPS} — switching to status-code filter (-fc $B1_CODE)"
+                ffuf \
+                  -w subs_bare.txt \
+                  -u "https://$ip" \
+                  -H "Host: FUZZ" \
+                  -k \
+                  -mc all \
+                  -fc "000,${B1_CODE},404,400,500,502,503" \
+                  -t 40 \
+                  -timeout 5 \
+                  -rate 80 \
+                  -maxtime 120 \
+                  -o "results/https_${safe_ip}.json" \
+                  -of json \
+                  -s 2>/dev/null \
+                  && echo "    [✓] HTTPS fuzz done" \
+                  || echo "    [!] ffuf HTTPS failed on $ip — continuing"
+              else
+                ffuf \
+                  -w subs_bare.txt \
+                  -u "https://$ip" \
+                  -H "Host: FUZZ" \
+                  -k \
+                  -mc all \
+                  -fc "000,404,400,500,502,503" \
+                  -fs "$BASELINE_HTTPS" \
+                  -t 40 \
+                  -timeout 5 \
+                  -rate 80 \
+                  -maxtime 120 \
+                  -o "results/https_${safe_ip}.json" \
+                  -of json \
+                  -s 2>/dev/null \
+                  && echo "    [✓] HTTPS fuzz done" \
+                  || echo "    [!] ffuf HTTPS failed on $ip — continuing"
+              fi
+              FUZZED_RUNS=$((FUZZED_RUNS + 1))
+            fi
+
+          done < ips.txt
+
+          echo ""
+          echo "========================================"
+          echo "[✓] Fuzzing complete"
+          echo "    IPs processed : $FUZZED_IPS"
+          echo "    Protocol runs : $FUZZED_RUNS"
+          echo "    Skipped       : $SKIPPED"
+          echo "========================================"
+
+      - name: Parse all results into summary
+        run: |
+
+          [ -s results/ip_map.txt ] || { echo "⚠️ ip_map.txt empty — no IPs were processed"; exit 1; }
+
+          echo "Protocol,IP,Host,Status,Length,Words" > results/hits.csv
+
+          declare -A ip_map
+          while IFS='=' read -r safe real; do
+            [[ -z "$safe" || -z "$real" ]] && continue
+            ip_map["$safe"]="$real"
+          done < results/ip_map.txt
+
+          shopt -s nullglob
+          json_files=(results/*.json)
+
+          if [ ${#json_files[@]} -eq 0 ]; then
+            echo "⚠️  No result JSON files found — all IPs unreachable or no hits"
+            echo "No hits found" >> results/hits.csv
+            exit 0
+          fi
+
+          for f in "${json_files[@]}"; do
+            filename=$(basename "$f" .json)
+            proto=$(echo "$filename" | grep -oE '^https?')
+            sanitized_ip=$(echo "$filename" | sed -E 's/^https?_//')
+            real_ip="${ip_map[$sanitized_ip]:-$sanitized_ip}"
+
+            python3 - "$f" "$proto" "$real_ip" <<'PYEOF'
+import json, sys
+
+filepath = sys.argv[1]
+proto    = sys.argv[2]
+ip       = sys.argv[3]
+
+try:
+    with open(filepath) as fh:
+        data = json.load(fh)
+except Exception as e:
+    print(f"# Could not parse {filepath}: {e}", file=sys.stderr)
+    sys.exit(0)
+
+results = data.get("results", [])
+if not results:
+    sys.exit(0)
+
+for r in results:
+    host   = r.get("input", {}).get("FUZZ", "?")
+    status = r.get("status", "?")
+    length = r.get("length", "?")
+    words  = r.get("words", "?")
+    print(f"{proto},{ip},{host},{status},{length},{words}")
+PYEOF
+
+          done >> results/hits.csv
+
+          echo ""
+          echo "=== HITS FOUND ==="
+          HITS=$(grep -vc '^#\|^Protocol\|^No hits' results/hits.csv || true)
+          echo "Total hits: $HITS"
+          echo ""
+          cat results/hits.csv
+
+      - name: Upload full results folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhost-all-results
+          path: results/
+          retention-days: 7

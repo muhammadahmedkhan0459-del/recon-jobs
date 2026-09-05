@@ -36,6 +36,8 @@ jobs:
 
       - name: Run VHOST Fuzz on all IPs
         run: |
+          set +e   # ← KEY FIX: don't die on non-zero exits inside the loop
+
           mkdir -p results
           SKIPPED=0
           FUZZED_IPS=0
@@ -98,9 +100,8 @@ jobs:
                   -fc "000,${B1_CODE},404,400,500,502,503" \
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/http_${safe_ip}.json" \
-                  -of json -s 2>/dev/null \
-                  && echo "    [+] HTTP fuzz done" \
-                  || echo "    [!] ffuf HTTP failed on $ip - continuing"
+                  -of json -s 2>/dev/null
+                echo "    [+] HTTP fuzz done"
               else
                 ffuf \
                   -w subs_bare.txt \
@@ -111,9 +112,8 @@ jobs:
                   -fs "$BASELINE_HTTP" \
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/http_${safe_ip}.json" \
-                  -of json -s 2>/dev/null \
-                  && echo "    [+] HTTP fuzz done" \
-                  || echo "    [!] ffuf HTTP failed on $ip - continuing"
+                  -of json -s 2>/dev/null
+                echo "    [+] HTTP fuzz done"
               fi
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi
@@ -157,9 +157,8 @@ jobs:
                   -fc "000,${B1_CODE},404,400,500,502,503" \
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/https_${safe_ip}.json" \
-                  -of json -s 2>/dev/null \
-                  && echo "    [+] HTTPS fuzz done" \
-                  || echo "    [!] ffuf HTTPS failed on $ip - continuing"
+                  -of json -s 2>/dev/null
+                echo "    [+] HTTPS fuzz done"
               else
                 ffuf \
                   -w subs_bare.txt \
@@ -170,9 +169,8 @@ jobs:
                   -fs "$BASELINE_HTTPS" \
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/https_${safe_ip}.json" \
-                  -of json -s 2>/dev/null \
-                  && echo "    [+] HTTPS fuzz done" \
-                  || echo "    [!] ffuf HTTPS failed on $ip - continuing"
+                  -of json -s 2>/dev/null
+                echo "    [+] HTTPS fuzz done"
               fi
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi

@@ -2,24 +2,25 @@ name: VHOST Fuzzer
 
 on:
   workflow_dispatch:
+    inputs:
+      total_chunks:
+        description: "How many parallel chunks to split IPs into (default 4 = ~24h coverage)"
+        required: false
+        default: "4"
 
 jobs:
-  fuzz:
+  # ─────────────────────────────────────────────────────────────
+  # STEP 1: Split ips.txt into N chunks and upload as artifacts
+  # ─────────────────────────────────────────────────────────────
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 1559
-
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      - name: Install ffuf
-        run: |
-          wget -q https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz
-          tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
-          sudo mv ffuf /usr/local/bin/
-          ffuf -V
-
-      - name: Verify files exist
+      - name: Verify required files
         run: |
           [ -f ips.txt ]       || { echo "ips.txt not found!";       exit 1; }
           [ -f subs_bare.txt ] || { echo "subs_bare.txt not found!"; exit 1; }
@@ -34,18 +35,100 @@ jobs:
           mv subs_clean.txt subs_bare.txt
           echo "subs_bare.txt -> $(wc -l < subs_bare.txt) unique bare subdomains"
 
-      - name: Run VHOST Fuzz on all IPs
+      - name: Upload cleaned subs_bare.txt for workers
+        uses: actions/upload-artifact@v4
+        with:
+          name: subs-clean
+          path: subs_bare.txt
+          retention-days: 1
+
+      - name: Split IPs into chunks and build matrix
+        id: split
+        run: |
+          TOTAL_CHUNKS=${{ github.event.inputs.total_chunks }}
+          TOTAL_IPS=$(wc -l < ips.txt)
+          echo "Splitting $TOTAL_IPS IPs into $TOTAL_CHUNKS chunks"
+
+          mkdir -p chunks
+          split -n l/$TOTAL_CHUNKS ips.txt chunks/chunk_
+
+          # Rename to numeric: chunk_0, chunk_1, ...
+          i=0
+          for f in chunks/chunk_*; do
+            mv "$f" "chunks/chunk_${i}.txt"
+            echo "  chunk_${i}: $(wc -l < chunks/chunk_${i}.txt) IPs"
+            i=$((i+1))
+          done
+
+          # Upload all chunks as a single artifact
+          echo "Uploading chunk files..."
+
+          # Build JSON matrix ["0","1","2","3"]
+          MATRIX=$(python3 -c "
+          import json, os
+          chunks = sorted([f.replace('chunk_','').replace('.txt','') for f in os.listdir('chunks') if f.endswith('.txt')])
+          print(json.dumps({'chunk': chunks}))
+          ")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Matrix: $MATRIX"
+
+      - name: Upload IP chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: ip-chunks
+          path: chunks/
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # STEP 2: Parallel fuzz workers — one per chunk (up to 6h each)
+  # ─────────────────────────────────────────────────────────────
+  fuzz:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 359   # 5h 59m — stays under GitHub's 6h hard limit
+    strategy:
+      fail-fast: false      # keep other chunks running if one fails/times out
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Download IP chunk
+        uses: actions/download-artifact@v4
+        with:
+          name: ip-chunks
+          path: chunks/
+
+      - name: Download cleaned wordlist
+        uses: actions/download-artifact@v4
+        with:
+          name: subs-clean
+          path: .
+
+      - name: Show chunk info
+        run: |
+          CHUNK_FILE="chunks/chunk_${{ matrix.chunk }}.txt"
+          echo "Worker chunk : ${{ matrix.chunk }}"
+          echo "IPs in chunk : $(wc -l < $CHUNK_FILE)"
+          head -5 $CHUNK_FILE
+
+      - name: Install ffuf
+        run: |
+          wget -q https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz
+          tar -xzf ffuf_2.1.0_linux_amd64.tar.gz
+          sudo mv ffuf /usr/local/bin/
+          ffuf -V
+
+      - name: Run VHOST Fuzz
         run: |
           set +e
-
+          CHUNK_FILE="chunks/chunk_${{ matrix.chunk }}.txt"
           mkdir -p results
+
           SKIPPED=0
           FUZZED_IPS=0
           FUZZED_RUNS=0
-
           > results/ip_map.txt
 
-          # ── parse & save hits so far ──────────────────
+          # ── inline CSV saver (called at checkpoints & on exit) ──
           parse_and_save() {
             python3 - << 'PYEOF'
           import json, os, glob
@@ -85,67 +168,90 @@ jobs:
               status = r.get("status", "?")
               length = r.get("length", "?")
               words  = r.get("words", "?")
-              rows.append(f"{proto},{real_ip},{host},{status},{length},{words}")
+              rows.append((proto, real_ip, host, status, length, words))
 
+          # ── hits.csv (raw data) ──────────────────────────────
           with open("results/hits.csv", "w") as out:
             out.write("Protocol,IP,Host,Status,Length,Words\n")
             for row in rows:
-              out.write(row + "\n")
+              out.write(",".join(str(c) for c in row) + "\n")
 
-          print(f"[checkpoint] Hits saved: {len(rows)}")
+          # ── hits_readable.txt (human-friendly) ──────────────
+          with open("results/hits_readable.txt", "w") as out:
+            out.write("=" * 72 + "\n")
+            out.write("  VHOST FUZZER — RESULTS SUMMARY\n")
+            out.write("=" * 72 + "\n\n")
+
+            # group by IP
+            by_ip = {}
+            for proto, ip, host, status, length, words in rows:
+              key = (proto, ip)
+              by_ip.setdefault(key, []).append((host, status, length, words))
+
+            if not by_ip:
+              out.write("  No hits found yet.\n")
+            else:
+              for (proto, ip), hits in sorted(by_ip.items()):
+                out.write(f"  [{proto.upper()}] {ip}\n")
+                out.write("  " + "-" * 68 + "\n")
+                out.write(f"  {'Host':<45} {'Status':>6}  {'Length':>8}  {'Words':>8}\n")
+                out.write("  " + "-" * 68 + "\n")
+                for host, status, length, words in sorted(hits, key=lambda x: str(x[0])):
+                  out.write(f"  {host:<45} {str(status):>6}  {str(length):>8}  {str(words):>8}\n")
+                out.write("\n")
+
+            out.write("=" * 72 + "\n")
+            out.write(f"  Total hits : {len(rows)}\n")
+            out.write(f"  Total IPs  : {len(by_ip)}\n")
+            out.write("=" * 72 + "\n")
+
+          print(f"[checkpoint] Hits saved: {len(rows)} rows")
           PYEOF
           }
 
-          # ── trap: save on ANY exit (timeout, kill, error) ──
-          trap 'echo ""; echo "=== TRAP TRIGGERED - saving results ==="; parse_and_save; echo "=== Results saved ==="' EXIT
+          # ── save on ANY exit (timeout, cancel, error) ────────
+          trap 'echo ""; echo "=== TRAP: saving final results ==="; parse_and_save; echo "=== Done ==="' EXIT
 
           while IFS= read -r raw_ip; do
-
             [[ -z "$raw_ip" || "$raw_ip" == \#* ]] && continue
 
             safe_ip=$(echo "$raw_ip" | tr './' '__' | tr -dc 'A-Za-z0-9_-')
             ip="$raw_ip"
-
             echo "${safe_ip}=${ip}" >> results/ip_map.txt
 
             echo ""
             echo "========================================"
-            echo "[*] Fuzzing: $ip"
+            echo "[*] Fuzzing: $ip  (chunk ${{ matrix.chunk }})"
             echo "========================================"
-
             FUZZED_IPS=$((FUZZED_IPS + 1))
 
-            # ── HTTP ──────────────────────────────────────
+            # ── HTTP baseline ────────────────────────────────
             read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "http://$ip" 2>/dev/null)
             B1_CODE="${B1_CODE:-000}"
-
             read B2_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "http://$ip" 2>/dev/null)
-
             read B3_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "http://$ip" 2>/dev/null)
-
             BASELINE_HTTP=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
               grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 
             if [ -z "$BASELINE_HTTP" ] || [ "$B1_CODE" = "000" ]; then
-              echo "    [!] HTTP unreachable on $ip - skipping HTTP"
+              echo "    [!] HTTP unreachable — skipping"
               SKIPPED=$((SKIPPED + 1))
             else
-              echo "    [+] HTTP baseline size = $BASELINE_HTTP | status = $B1_CODE"
-
+              echo "    [+] HTTP baseline size=$BASELINE_HTTP | status=$B1_CODE"
               if [ "$BASELINE_HTTP" = "0" ]; then
-                echo "    [!] Baseline size is 0 - switching to status-code filter"
+                echo "    [!] Baseline=0 → using status-code filter"
                 ffuf \
                   -w subs_bare.txt \
                   -u "http://$ip" \
@@ -155,7 +261,6 @@ jobs:
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/http_${safe_ip}.json" \
                   -of json -s 2>/dev/null
-                echo "    [+] HTTP fuzz done"
               else
                 ffuf \
                   -w subs_bare.txt \
@@ -167,42 +272,38 @@ jobs:
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/http_${safe_ip}.json" \
                   -of json -s 2>/dev/null
-                echo "    [+] HTTP fuzz done"
               fi
+              echo "    [+] HTTP fuzz done"
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi
 
-            # ── HTTPS ─────────────────────────────────────
+            # ── HTTPS baseline ───────────────────────────────
             read B1_BODY B1_CODE < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "https://$ip" 2>/dev/null)
             B1_CODE="${B1_CODE:-000}"
-
             read B2_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "https://$ip" 2>/dev/null)
-
             read B3_BODY _ < <(curl -sk -o /dev/null \
               -w "%{size_download} %{http_code}" \
               -H "Host: totalgarbagexyz123abc.com" \
               --connect-timeout 3 --max-time 5 \
               "https://$ip" 2>/dev/null)
-
             BASELINE_HTTPS=$(echo -e "$B1_BODY\n$B2_BODY\n$B3_BODY" | \
               grep -v '^\s*$' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 
             if [ -z "$BASELINE_HTTPS" ] || [ "$B1_CODE" = "000" ]; then
-              echo "    [!] HTTPS unreachable on $ip - skipping HTTPS"
+              echo "    [!] HTTPS unreachable — skipping"
               SKIPPED=$((SKIPPED + 1))
             else
-              echo "    [+] HTTPS baseline size = $BASELINE_HTTPS | status = $B1_CODE"
-
+              echo "    [+] HTTPS baseline size=$BASELINE_HTTPS | status=$B1_CODE"
               if [ "$BASELINE_HTTPS" = "0" ]; then
-                echo "    [!] Baseline size is 0 - switching to status-code filter"
+                echo "    [!] Baseline=0 → using status-code filter"
                 ffuf \
                   -w subs_bare.txt \
                   -u "https://$ip" \
@@ -212,7 +313,6 @@ jobs:
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/https_${safe_ip}.json" \
                   -of json -s 2>/dev/null
-                echo "    [+] HTTPS fuzz done"
               else
                 ffuf \
                   -w subs_bare.txt \
@@ -224,31 +324,128 @@ jobs:
                   -t 40 -timeout 5 -rate 80 -maxtime 120 \
                   -o "results/https_${safe_ip}.json" \
                   -of json -s 2>/dev/null
-                echo "    [+] HTTPS fuzz done"
               fi
+              echo "    [+] HTTPS fuzz done"
               FUZZED_RUNS=$((FUZZED_RUNS + 1))
             fi
 
-            # ── save every 25 IPs ─────────────────────────
+            # ── checkpoint every 25 IPs ──────────────────────
             if (( FUZZED_IPS % 25 == 0 )); then
-              echo "    [checkpoint] Saving results at $FUZZED_IPS IPs..."
+              echo "    [checkpoint] Saving at $FUZZED_IPS IPs..."
               parse_and_save
             fi
 
-          done < ips.txt
+          done < "$CHUNK_FILE"
 
           echo ""
           echo "========================================"
-          echo "[+] Fuzzing complete"
+          echo "[+] Chunk ${{ matrix.chunk }} complete"
           echo "    IPs processed : $FUZZED_IPS"
           echo "    Protocol runs : $FUZZED_RUNS"
           echo "    Skipped       : $SKIPPED"
           echo "========================================"
 
-      - name: Upload full results folder
-        if: always()
+      - name: Upload chunk results
+        if: always()   # upload even on timeout/cancel
         uses: actions/upload-artifact@v4
         with:
-          name: vhost-all-results
+          name: vhost-results-chunk-${{ matrix.chunk }}
           path: results/
           retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # STEP 3: Merge all chunk results into one final report
+  # ─────────────────────────────────────────────────────────────
+  merge:
+    needs: fuzz
+    runs-on: ubuntu-latest
+    if: always()   # run even if some fuzz jobs were cancelled/failed
+    steps:
+      - name: Download all chunk results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vhost-results-chunk-*
+          path: all-results/
+          merge-multiple: false   # keep separate dirs per chunk
+
+      - name: Merge into one report
+        run: |
+          mkdir -p final
+
+          python3 - << 'PYEOF'
+          import os, glob, csv
+
+          rows = []
+          # walk every chunk's hits.csv
+          for csv_path in sorted(glob.glob("all-results/*/hits.csv")):
+            try:
+              with open(csv_path, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                  rows.append(row)
+            except Exception as e:
+              print(f"  [warn] Could not read {csv_path}: {e}")
+
+          # dedupe (same proto+ip+host)
+          seen = set()
+          deduped = []
+          for r in rows:
+            key = (r.get("Protocol",""), r.get("IP",""), r.get("Host",""))
+            if key not in seen:
+              seen.add(key)
+              deduped.append(r)
+
+          deduped.sort(key=lambda r: (r.get("IP",""), r.get("Protocol",""), r.get("Host","")))
+
+          # ── final hits.csv ───────────────────────────────────
+          with open("final/hits.csv", "w", newline="") as out:
+            writer = csv.DictWriter(out, fieldnames=["Protocol","IP","Host","Status","Length","Words"])
+            writer.writeheader()
+            writer.writerows(deduped)
+
+          # ── final hits_readable.txt ──────────────────────────
+          by_ip = {}
+          for r in deduped:
+            key = (r.get("Protocol","?"), r.get("IP","?"))
+            by_ip.setdefault(key, []).append(r)
+
+          with open("final/hits_readable.txt", "w") as out:
+            out.write("=" * 72 + "\n")
+            out.write("  VHOST FUZZER — FINAL MERGED RESULTS\n")
+            out.write("=" * 72 + "\n\n")
+
+            if not deduped:
+              out.write("  No hits found across all chunks.\n\n")
+            else:
+              for (proto, ip), hits in sorted(by_ip.items()):
+                out.write(f"  [{proto.upper()}] {ip}\n")
+                out.write("  " + "-" * 68 + "\n")
+                out.write(f"  {'Host':<45} {'Status':>6}  {'Length':>8}  {'Words':>8}\n")
+                out.write("  " + "-" * 68 + "\n")
+                for r in sorted(hits, key=lambda x: x.get("Host","")):
+                  out.write(
+                    f"  {r.get('Host','?'):<45} "
+                    f"{r.get('Status','?'):>6}  "
+                    f"{r.get('Length','?'):>8}  "
+                    f"{r.get('Words','?'):>8}\n"
+                  )
+                out.write("\n")
+
+            out.write("=" * 72 + "\n")
+            out.write(f"  Total unique hits : {len(deduped)}\n")
+            out.write(f"  Total IPs with hits : {len(by_ip)}\n")
+            out.write("=" * 72 + "\n")
+
+          print(f"Merge complete: {len(deduped)} unique hits across {len(by_ip)} IPs")
+          PYEOF
+
+          echo ""
+          echo "=== Merged result preview ==="
+          cat final/hits_readable.txt
+
+      - name: Upload final merged report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vhost-FINAL-results
+          path: final/
+          retention-days: 14
